@@ -31,8 +31,9 @@ const { GH_TOKEN, GIST_ID, USERNAME, DAYS } = process.env;
     const fromDate = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
 
     const commits = [];
+    const seenCommits = new Set();
     try {
-      for (let page = 0; page < pages; page++) {
+      for (let page = 1; page <= pages; page++) {
         // https://docs.github.com/en/developers/webhooks-and-events/github-event-types#pushevent
         const pushEvents = (
           await api.fetch(
@@ -48,19 +49,57 @@ const { GH_TOKEN, GIST_ID, USERNAME, DAYS } = process.env;
         const isEnd = recentPushEvents.length < pushEvents.length;
         console.log(`${recentPushEvents.length} events fetched.`);
 
+        const commitRefs = (
+          await Promise.allSettled(
+            recentPushEvents.map(async ({ repo, payload }) => {
+              const isZeroBefore = /^0+$/.test(payload.before || "");
+              if (payload.before && payload.head && !isZeroBefore) {
+                const compare = await api.fetch(
+                  `/repos/${repo.name}/compare/${payload.before}...${payload.head}`
+                );
+                return compare.commits.map(({ sha }) => ({
+                  repo: repo.name,
+                  sha,
+                }));
+              }
+
+              return (payload.commits || [])
+                // Ignore duplicated commits when GitHub still includes the flag.
+                .filter((c) => c.distinct !== false)
+                .map((c) => ({ repo: repo.name, sha: c.sha }));
+            })
+          )
+        ).flatMap(({ status, value, reason }) => {
+          if (status === "fulfilled") {
+            return value;
+          }
+          console.warn(reason);
+          return [];
+        });
+
+        const newCommitRefs = commitRefs.filter(({ repo, sha }) => {
+          const key = `${repo}:${sha}`;
+          if (seenCommits.has(key)) {
+            return false;
+          }
+          seenCommits.add(key);
+          return true;
+        });
+
         commits.push(
           ...(
             await Promise.allSettled(
-              recentPushEvents.flatMap(({ repo, payload }) =>
-                payload.commits
-                  // Ignore duplicated commits
-                  .filter((c) => c.distinct === true)
-                  .map((c) => api.fetch(`/repos/${repo.name}/commits/${c.sha}`))
+              newCommitRefs.map(({ repo, sha }) =>
+                api.fetch(`/repos/${repo}/commits/${sha}`)
               )
             )
-          )
-            .filter(({ status }) => status === "fulfilled")
-            .map(({ value }) => value)
+          ).flatMap(({ status, value, reason }) => {
+            if (status === "fulfilled") {
+              return [value];
+            }
+            console.warn(reason);
+            return [];
+          })
         );
 
         if (isEnd) {
